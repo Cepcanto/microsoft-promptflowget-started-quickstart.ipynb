@@ -83,7 +83,38 @@ name: open_ai_connection
 module: promptflow.connections
 api_key: ${env:OPEN_AI_CONNECTION_API_KEY} # env reference
 ```
-You'll need to set up the environment variables in the container to make the connections work.
+You'll need to set up the environment variables in the container to make the connections work. For a full list of environment variables see [Load from environment variables](https://microsoft.github.io/promptflow/how-to-guides/manage-connections.html#load-from-environment-variables).
+
+#### Configuring the run and finish script
+
+Depending on your use case you made need to make changes to how your application runs. Out of the box, running `pf flow build...` will generate two scripts located under `runit/promptflow-serve/`, a `run` script used to initialise the flow, and a `finish` script used to gracefully shutdown the flow. These two scripts are where you can initialise and shutdown additional applications that run alongside your flow.
+
+For example, lets assume you want to add you need to run [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) within the same container.
+
+1. After running `pf flow build --format docker...` navigate to the output folder.
+
+2. Edit the `Dockerfile` to install your additional dependencies. In our case, add the following lines to your `Dockerfile`
+   ```Dockerfile
+   RUN apt-get update && apt-get install -y wget systemctl
+   RUN wget https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.104.0/otelcol_0.104.0_linux_amd64.deb && dpkg -i otelcol_0.104.0_linux_amd64.deb
+   ```
+
+3. Under `runit/promptflow-server/run` add the following command to start the OpenTelemetry Collector
+   ```bash
+   systemctl start otelcol
+   ```
+
+4. Finally, update `runit/promptflow-server/finish` to stop the collector when the container when a `SIGTERM` or `SIGINT` is issued
+   ```bash
+   # stop otelcol
+   echo "$(date -uIns) - Stopping otelcol processes"
+
+   systemctl stop otelcol
+
+   echo "$(date -uIns) - Stopped otelcol processes"
+   ```
+
+Now in order to use the OpenTelemetry Collector, set `OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4318` environment variable when running your container.
 
 ### Run with `docker run`
 

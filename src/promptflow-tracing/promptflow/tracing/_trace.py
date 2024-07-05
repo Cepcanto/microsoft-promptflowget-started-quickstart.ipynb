@@ -54,7 +54,7 @@ def handle_span_exception(span, exception):
         )
 
 
-def handle_output(span, inputs, output, trace_type):
+def handle_output(span, inputs, output, trace_type, function, *args, **kwargs):
     if isinstance(output, (Iterator, AsyncIterator)):
         # Set should_end to False to delay span end until generator exhaustion, preventing premature span end.
         setattr(span, "__should_end", False)
@@ -64,7 +64,7 @@ def handle_output(span, inputs, output, trace_type):
         else:
             return TracedAsyncIterator(span, inputs, output, trace_type)
     else:
-        enrich_span_with_trace_type(span, inputs, output, trace_type)
+        enrich_span_with_trace_type(span, inputs, output, trace_type, function, args, kwargs)
         span.set_status(StatusCode.OK)
         return Tracer.pop(output)
 
@@ -215,8 +215,8 @@ def enrich_span_with_input(span, input):
     return input
 
 
-def enrich_span_with_trace_type(span, inputs, output, trace_type):
-    SpanEnricherManager.enrich(span, inputs, output, trace_type)
+def enrich_span_with_trace_type(span, inputs, output, trace_type, function, *args, **kwargs):
+    SpanEnricherManager.enrich(span, inputs, output, trace_type, function, args, kwargs)
     # TODO: Move the following logic to SpanEnricher
     enrich_span_with_openai_tokens(span, trace_type)
 
@@ -554,7 +554,7 @@ def _traced_sync(
                 Tracer.push(trace)
                 enrich_span_with_input(span, trace.inputs)
                 output = func(*args, **kwargs)
-                output = handle_output(span, trace.inputs, output, trace_type)
+                output = handle_output(span, trace.inputs, output, trace_type, func, args, kwargs)
             except Exception as e:
                 Tracer.pop(None, e)
                 raise
@@ -606,18 +606,184 @@ def trace(func: Callable = None) -> Callable:
 
 
 class LLMSpanEnricher(SpanEnricher):
-    def enrich(self, span, inputs, output):
+    def enrich(self, span, inputs, output, function, *args, **kwargs):
         token_collector.collect_openai_tokens(span, output)
         enrich_span_with_llm_output(span, output)
-        super().enrich(span, inputs, output)
+        super().enrich(span, inputs, output, function, args, kwargs)
 
 
 class EmbeddingSpanEnricher(SpanEnricher):
-    def enrich(self, span, inputs, output):
+    def enrich(self, span, inputs, output, function, *args, **kwargs):
         token_collector.collect_openai_tokens(span, output)
         enrich_span_with_embedding(span, inputs, output)
-        super().enrich(span, inputs, output)
+        super().enrich(span, inputs, output, function, args, kwargs)
+
+
+class AssistantSpanEnricher(SpanEnricher):
+    def enrich(self, span, inputs, output, function, *args, **kwargs):
+        token_collector.collect_openai_tokens(span, output)
+        if not IS_LEGACY_OPENAI:
+            from openai.types.beta.assistant import Assistant
+
+            if isinstance(output, (Assistant)):
+                model = output.model
+                name = output.name
+                id = output.id
+                instructions = output.instructions
+                tools = output.tools
+            try:
+                span.set_attribute("llm.assistant_id", id) if id is not None else None
+                span.set_attribute("llm.assistant_model", model) if model is not None else None
+                span.set_attribute("llm.assistant_name", name) if name is not None else None
+                span.set_attribute("llm.assistant_instructions", instructions) if instructions is not None else None
+                span.set_attribute("llm.assistant_tools", serialize_attribute(tools)) if tools is not None else None
+                if function.__name__ == "create":
+                    span.add_event("promptflow.llm.created_assistant", {"llm.assistant_id": id})
+                elif function.__name__ == "update":
+                    span.add_event("promptflow.llm.updated_assistant", {"llm.assistant_id": id})
+                elif function.__name__ == "delete":
+                    span.add_event("promptflow.llm.deleted_assistant", {"llm.assistant_id": id})
+            except Exception as e:
+                logging.warning(f"Failed to enrich span with assistant: {e}")
+        super().enrich(span, inputs, output, function, args, kwargs)
+
+
+class ThreadSpanEnricher(SpanEnricher):
+    def enrich(self, span, inputs, output, function, *args, **kwargs):
+        token_collector.collect_openai_tokens(span, output)
+        if not IS_LEGACY_OPENAI:
+            from openai.types.beta.thread import Thread
+
+            if isinstance(output, (Thread)):
+                id = output.id
+                created_at = output.created_at
+                try:
+                    span.set_attribute("llm.thread_id", id) if id is not None else None
+                    span.set_attribute("llm.thread_created_at", created_at) if created_at is not None else None
+                    tool_resources = ""
+                    if len(args[0]) > 0:
+                        if len(args[0][0]) > 1:
+                            if isinstance(args[0][0][1], dict):
+                                dictionary = args[0][0][1]
+                                if "tool_resources" in dictionary:
+                                    tool_resources = dictionary.get("tool_resources")
+                    span.set_attribute(
+                        "llm.thread_tool_resources", serialize_attribute(tool_resources)
+                    ) if tool_resources is not None else None
+                    if function.__name__ == "create":
+                        span.add_event("promptflow.llm.created_thread", {"llm.thread_id": id})
+                    elif function.__name__ == "update":
+                        span.add_event("promptflow.llm.updated_thread", {"llm.thread_id": id})
+                    elif function.__name__ == "delete":
+                        span.add_event("promptflow.llm.deleted_thread", {"llm.thread_id": id})
+                except Exception as e:
+                    logging.warning(f"Failed to enrich span with thread: {e}")
+        super().enrich(span, inputs, output, function, args, kwargs)
+
+
+class MessageSpanEnricher(SpanEnricher):
+    def enrich(self, span, inputs, output, function, *args, **kwargs):
+        token_collector.collect_openai_tokens(span, output)
+        if not IS_LEGACY_OPENAI:
+            from openai.types.beta.threads.message import Message
+
+            if isinstance(output, (Message)):
+                id = output.id
+                thread_id = output.thread_id
+                role = output.role
+                assistant_id = output.assistant_id
+                run_id = output.run_id
+                created_at = output.created_at
+                completed_at = output.completed_at
+            try:
+                span.set_attribute("llm.message_id", id) if id is not None else None
+                span.set_attribute("llm.message_thread_id", thread_id) if thread_id is not None else None
+                span.set_attribute("llm.message_role", role) if role is not None else None
+                span.set_attribute("llm.message_assistant_id", assistant_id) if assistant_id is not None else None
+                span.set_attribute("llm.message_run_id", run_id) if run_id is not None else None
+                span.set_attribute("llm.message_created_at", created_at) if created_at is not None else None
+                span.set_attribute("llm.message_completed_at", completed_at) if completed_at is not None else None
+                if function.__name__ == "create":
+                    span.add_event("promptflow.llm.created_message", {"llm.message_id": id})
+                elif function.__name__ == "update":
+                    span.add_event("promptflow.llm.updated_message", {"llm.message_id": id})
+                elif function.__name__ == "delete":
+                    span.add_event("promptflow.llm.deleted_message", {"llm.message_id": id})
+            except Exception as e:
+                logging.warning(f"Failed to enrich span with message: {e}")
+        super().enrich(span, inputs, output, function, args, kwargs)
+
+
+class RunSpanEnricher(SpanEnricher):
+    def enrich(self, span, inputs, output, function, *args, **kwargs):
+        token_collector.collect_openai_tokens(span, output)
+        if not IS_LEGACY_OPENAI:
+            from openai.types.beta.threads.run import Run
+
+            if isinstance(output, (Run)):
+                id = output.id
+                thread_id = output.thread_id
+                assistant_id = output.assistant_id
+                instructions = output.instructions
+                max_completion_tokens = output.max_completion_tokens
+                max_prompt_tokens = output.max_prompt_tokens
+                model = output.model
+                created_at = output.created_at
+                started_at = output.started_at
+                completed_at = output.completed_at
+                cancelled_at = output.cancelled_at
+                expires_at = output.expires_at
+                failed_at = output.failed_at
+                last_error = output.last_error
+                status = output.status
+                completion_tokens = 0
+                prompt_tokens = 0
+                total_tokens = 0
+                usage = output.usage
+                if usage is not None:
+                    completion_tokens = 0
+                    prompt_tokens = 0
+                    total_tokens = 0
+
+            try:
+                span.set_attribute("llm.run_id", id) if id is not None else None
+                span.set_attribute("llm.run_thread_id", thread_id) if thread_id is not None else None
+                span.set_attribute("llm.run_assistant_id", assistant_id) if assistant_id is not None else None
+                span.set_attribute("llm.run_instructions", instructions) if instructions is not None else None
+                span.set_attribute(
+                    "llm.run_max_completion_tokens", max_completion_tokens
+                ) if max_completion_tokens is not None else None
+                span.set_attribute(
+                    "llm.run_max_prompt_tokens", max_prompt_tokens
+                ) if max_prompt_tokens is not None else None
+                span.set_attribute("llm.run_model", model) if model is not None else None
+                span.set_attribute("llm.run_created_at", created_at) if created_at is not None else None
+                span.set_attribute("llm.run_started_at", started_at) if started_at is not None else None
+                span.set_attribute("llm.run_cancelled_at", cancelled_at) if cancelled_at is not None else None
+                span.set_attribute("llm.run_expires_at", expires_at) if expires_at is not None else None
+                span.set_attribute("llm.run_failed_at", failed_at) if failed_at is not None else None
+                span.set_attribute("llm.run_message_completed_at", completed_at) if completed_at is not None else None
+                span.set_attribute("llm.run_last_error", last_error) if last_error is not None else None
+                span.set_attribute("llm.run_status", status) if status is not None else None
+                span.set_attribute(
+                    "llm.run_completion_tokens", completion_tokens
+                ) if completion_tokens is not None else None
+                span.set_attribute("llm.run_prompt_tokens", prompt_tokens) if prompt_tokens is not None else None
+                span.set_attribute("llm.run_total_tokens", total_tokens) if total_tokens is not None else None
+                if function.__name__ == "create":
+                    span.add_event("promptflow.llm.created_run", {"llm.run_id": id})
+                elif function.__name__ == "update":
+                    span.add_event("promptflow.llm.updated_run", {"llm.run_id": id})
+                elif function.__name__ == "retrieve":
+                    span.add_event("promptflow.llm.retrieved_run", {"llm.run_id": id})
+            except Exception as e:
+                logging.warning(f"Failed to enrich span with message: {e}")
+        super().enrich(span, inputs, output, function, args, kwargs)
 
 
 SpanEnricherManager.register(TraceType.LLM, LLMSpanEnricher())
 SpanEnricherManager.register(TraceType.EMBEDDING, EmbeddingSpanEnricher())
+SpanEnricherManager.register(TraceType.ASSISTANT, AssistantSpanEnricher())
+SpanEnricherManager.register(TraceType.THREAD, ThreadSpanEnricher())
+SpanEnricherManager.register(TraceType.MESSAGE, MessageSpanEnricher())
+SpanEnricherManager.register(TraceType.RUN, RunSpanEnricher())

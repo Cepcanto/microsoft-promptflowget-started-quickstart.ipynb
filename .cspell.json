@@ -111,6 +111,7 @@
     "uvicorn",
     "attribited",
     "MistralAI",
+    "probs",
     "llmlingua",
     "myconn"
   ],
